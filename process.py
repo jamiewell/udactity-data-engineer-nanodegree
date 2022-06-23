@@ -1,14 +1,17 @@
-import os
-import configparser
-
-from datetime import datetime
-
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf, monotonically_increasing_id, col,when, split, coalesce
 from pyspark.sql.functions import year, month, dayofmonth 
 from pyspark.sql.types import TimestampType, StructType, StructField, DoubleType, StringType
 
 
+def filterNullValues(dataFrame, field):
+    """
+    Function: filter null values from dataframe
+    @params
+    dataframe: spark dataFrame
+    field: target field to filter dataframe
+    """
+    return dataFrame.filter(col(field).isNotNull())
 
 def filterTargetData(dataFrame, field, name):
     """
@@ -22,14 +25,13 @@ def filterTargetData(dataFrame, field, name):
     return dataFrame.filter( col(field) == name)
 
 
-def loadData(spark, formatType ,path):
+def loadData(spark, formatType, path):
     """
     Function : read data from the selected storage
     @params 
     spark: sparkSession
     path: the selected storage
-    """ 
-    
+    """
     return spark.read.format(formatType)\
                         .option("header", 'true')\
                         .load(path)
@@ -50,12 +52,17 @@ def processProductData(dataFrame):
     @params 
     dataframe: spark dataframe
     """
-    
+
+    productCode = dataFrame.select('product_id').distinct()
+
     # Required : casting price data type
-    productTable = dataFrame\
+    productData = dataFrame\
                     .withColumn("price", col("price").cast(DoubleType()))\
                     .select('product_id','category_id','category_code','brand','price').drop_duplicates()
-    
+
+    productTable = productCode.alias('m').join(productData.alias('s'), on=['product_id'], how='inner' )\
+                                .select('m.product_id','category_id','category_code','brand','price')
+
     return fillNullProductData(productTable)
     
 def processEventData(dataFrame): 
@@ -64,8 +71,13 @@ def processEventData(dataFrame):
     @params 
     dataframe: spark dataframe
     """
-    
-    return dataFrame.select('event_time','event_type','product_id','user_session').drop_duplicates()
+    productCode = dataFrame.select('product_id').distinct()
+    eventData = dataFrame.select('event_time','event_type','product_id','user_session').drop_duplicates()
+
+    eventTable = productCode.alias('m').join(eventData.alias('s'), on=['product_id'], how='inner' ) \
+        .select('event_time','event_type','product_id','user_session')
+
+    return eventTable
 
 
 def processUserData(dataFrame):
@@ -73,25 +85,40 @@ def processUserData(dataFrame):
     Function : process user data to return unique data in selected fields
     @params 
     dataframe: spark dataframe
-    """ 
-    
-    return dataFrame.select('user_session','user_id').drop_duplicates()
- 
-    
-def writeData(dataFrame, isPartitioned, partition, path):
+    """
+    sessionCode = dataFrame.select('user_session').distinct()
+    userData = dataFrame.select('user_session','user_id').drop_duplicates()
+
+    userTable = sessionCode.alias('m').join(userData.alias('s'), on=['user_session'], how='inner' ) \
+                .select('user_session','user_id')
+
+    return userTable
+
+def writeCsvData(dataFrame, outputPath):
+    """
+    Function : write csv data to the selected storage
+    @params
+    dataframe: spark dataframe
+    outputPath: storage where data take places
+    """
+    return dataFrame.coalesce(1).write.option("header",True)\
+        .csv(outputPath, mode='overwrite')
+
+def writeParquetData(dataFrame, isPartitioned, partition, outputPath):
     """
     Function : write data to the selected storage
-    @params 
+    @params
     dataframe: spark dataframe
-    isPartitioned: boolean type. detect wheter required to partiton or not
+    isPartitioned: boolean type. enable to partition or not
     outputPath: storage where data take places
-    key: folder name    
-    """ 
-    
+    key: folder name
+    """
     if(isPartitioned):
-        return dataFrame.write.partitionBy(partition).parquet(path, mode='overwrite')
+        print('Partitioned')
+        return dataFrame.write.partitionBy(partition).parquet(outputPath, mode='overwrite')
     else:
-        return dataFrame.write.parquet(path, mode='overwrite')
+        print('Non-Partitioned')
+        return dataFrame.write.parquet(outputPath, mode='overwrite')
         
     
 def transformProductData(dataFrame):
@@ -100,15 +127,11 @@ def transformProductData(dataFrame):
     action1) create new fields : category_major , category_middle, category_micro respectively
     action2) fill micro category if category code exists 2 words code only
     """
-
-    ## Insert default values into null category 
-    #fillCategory = dataFrame.fillna({'brand':'none','category_code':'category1.category2.category3'})
-    
     splitCategory = dataFrame.withColumn("category_major", split(col("category_code"),'\.').getItem(0))\
-                                .withColumn("category_middle", split(col("category_code"),'\.').getItem(1))\
-                                .withColumn("category_micro", split(col("category_code"),'\.').getItem(2))\
-                                .withColumn('category_micro', coalesce(  "category_micro",  "category_middle" ))\
-                                .select('brand','category_major', 'category_middle', 'category_micro', 'category_id', 'product_id', 'price')
+                            .withColumn("category_middle", split(col("category_code"),'\.').getItem(1))\
+                            .withColumn("category_micro", split(col("category_code"),'\.').getItem(2))\
+                            .withColumn('category_micro', coalesce(  "category_micro",  "category_middle" ))\
+                            .select('brand','category_major', 'category_middle', 'category_micro', 'category_id', 'product_id', 'price')
     return splitCategory
 
 
@@ -117,13 +140,11 @@ def transformEventData(dataFrame):
     transformation : make event_time to get time unit respectively
     action1) create new fields : year, month, day
     """
-    
     eventTime = dataFrame.withColumn("yyyyMmDd", split(col("event_time"),' ').getItem(0))\
                         .withColumn("year", year("yyyyMmDd"))\
                         .withColumn("month", month("yyyyMmDd"))\
                         .withColumn("day", dayofmonth("yyyyMmDd"))\
                         .select('event_time', 'year', 'month','day','event_type','product_id','user_session')
-
     return eventTime
 
 
@@ -135,68 +156,18 @@ def filterTargetData(dataFrame, field, name):
     field: target field to filter dataframe
     name: value to filter data
     """
-    
     return dataFrame.filter( col(field) == name)
   
     
 def summaryTargetData(mainData, subData):
     """
-    function : 
-    
-    """ 
-    
+    function : To aggregate input data
+    @Params
+    mainData: main data including selling price
+    subData : sub Data with time units to join main data
+    """
     #joinData = mainData.join(mainData , mainData.product_id == subData.product_id , how='inner')
     joinData = mainData.alias("M").join( subData.alias("S"), mainData.product_id == subData.product_id, how='inner')
-    
-    return joinData.groupBy('day','event_type','category_micro')\
+    return joinData.groupBy('year','month','day','event_type','brand','category_micro')\
                     .sum('M.price')\
-                    .withColumnRenamed("sum(price)", "totalSum") \
-    
-    
-def validateData(data, count):
-    """
-    To run quailty check fucntion
-    @params
-    data: the list of dataframe
-    """
-    
-    if not data:
-        return
-    else:
-        for df in data:
-            quality_checks(data, count)
-            
-            
-def quality_checks(dataframe, count):
-    """
-    To check dimension tables to make sure tables completes normally.
-    @params
-    :dataframe: spark dataframe
-    :tableName: table name
-    """
-    
-    total_count = dataframe.count()
-    if total_count != count:
-        print(f"Data quality : Total records {total_count} with zero records!")
-    else:
-        print(f"Data quality : table with {total_count} records.")
-    return 0
- 
-    
-def createPath(isPartition, path, key):
-    """
-    function: create data path
-    @params
-    :isPartition: boolean type. make new path to read parquet files
-    :path: input path
-    """
-    
-    mainPath = ''
-    if(isPartition):
-        keyPath = path+key
-        mainPath = os.path.join(keyPath, '*/*/') 
-    else:
-        mainPath = os.path.join(path, key) 
-        
-    return mainPath
-        
+                    .withColumnRenamed("sum(price)", "totalSum")

@@ -2,11 +2,10 @@
 import os
 import configparser
 
-from datetime import datetime
-
 from pyspark.sql import SparkSession
 
 import process
+import utils
 
 config = configparser.ConfigParser()
 config.read('dl.cfg', encoding='utf-8-sig')
@@ -26,7 +25,7 @@ parquetFormat = config['KEYS']['PARQUET_FORAMT']
 
 targetField = config['KEYS']['TAGET_FILED']
 targetBrand = config['KEYS']['TAGET_BRAND']
-count=config['KEYS']['VALID_COUNT']
+validCount=config['KEYS']['VALID_COUNT']
     
     
     
@@ -35,7 +34,6 @@ def sparkSession():
             .builder\
             .config("spark.jars.packages","org.apache.hadoop:hadoop-aws:2.7.0")\
             .getOrCreate()
-
     return spark
 
 
@@ -48,7 +46,7 @@ def createProductTable(dataFrame, path):
     """
     productData = process.processProductData(dataFrame)
 
-    return process.writeData(productData, False, targetField, path)
+    return process.writeParquetData(productData, False, targetField, path)
 
 
 def createEventTable(dataFrame, path):
@@ -60,7 +58,7 @@ def createEventTable(dataFrame, path):
     """
     eventData = process.processEventData(dataFrame)
     
-    return process.writeData(eventData, False, '', path)
+    return process.writeParquetData(eventData, False, '', path)
 
 
 def createUserTable(dataFrame, path):
@@ -71,52 +69,71 @@ def createUserTable(dataFrame, path):
     path: path where the data writes
     """
     userData = process.processUserData(dataFrame)
-        
-    return process.writeData(userData, False, '', path)
-    
-    
+    return process.writeParquetData(userData, False, '', path)
+
+
+def runDataQualityCheck(dataFrame, info, count):
+    """
+    Function:
+     @params
+     dataFrame: spark dataFrame
+     format: data format
+     path: path to locate data
+     info: table name with primary key (dictionary type)
+     """
+
+    return utils.validateData(dataFrame, info, count)
+
+
 def main():
     
     spark = sparkSession()
  
     # load Raw data
     rawData = process.loadData(spark, csvFormat, s3Url)
-    
+    mainData = rawData.drop_duplicates()
+
     #productPath = s3Url+product
-    productPath = process.createPath(False, s3Url , product) 
-    createProductTable(rawData, productPath)
+    productPath = utils.createPath(False, s3Url, product)
+    createProductTable(mainData, productPath)
     
     #eventPath = s3Url+event
-    eventPath = process.createPath(False, s3Url , event) 
-    createEventTable(rawData, eventPath)
+    eventPath = utils.createPath(False, s3Url, event)
+    createEventTable(mainData, eventPath)
     
     #userPath = s3Url+user
-    userPath = process.createPath(False, s3Url , user) 
-    createUserTable(rawData, userPath)
-     
-    #Load Product Data
-    readProductPath = process.createPath(False , s3Url , product)   
-    productList = process.loadData(spark, parquetFormat, readProductPath)
-    # Load Event Data
-    readEventPath = process.createPath(False , s3Url , event)   
-    eventList = process.loadData(spark, parquetFormat, readEventPath)
-    
-    #Transformation    
+    userPath = utils.createPath(False, s3Url, user)
+    createUserTable(mainData, userPath)
+
+    productInfo = {'product':'product_id'}
+    productList = process.loadData(spark, parquetFormat, productPath)
+    runDataQualityCheck(productList, productInfo, validCount)
+
+    eventInfo = {'product':'product_id', 'user':'user_session'}
+    eventList = process.loadData(spark, parquetFormat, eventPath)
+    runDataQualityCheck(eventList, eventInfo, validCount)
+
+    userInfo = {'user':'user_session'}
+    userList = process.loadData(spark, parquetFormat, userPath)
+    runDataQualityCheck(userList, userInfo, validCount)
+
+    #Transformation
     targetData = process.filterTargetData(productList, targetField, targetBrand)
     createCategory = process.transformProductData(targetData)
-    createTime = process.transformEventData(eventList)
-    
-    
+    createTimeUnit = process.transformEventData(eventList)
+
     #Summary target data
-    summaryData = process.summaryTargetData(createCategory, createTime)
+    summaryData = process.summaryTargetData(createCategory, createTimeUnit)
  
-    #Data Qualtiy Check
-    process.validateData(summaryData, count)
+    #Data Qualtiy Check_2 : To ensure validation tables are normal
+    summaryInfo = {'product':'product_id', 'user':'user_session'}
+
+    runDataQualityCheck(summaryData, summaryInfo, validCount)
      
     #Summary result
-    summaryPath = process.createPath(False , s3Url , summary) 
-    process.writeData(summaryData, False, '', summaryPath)
-    
+    summaryPath = utils.createPath(False , s3Url , summary)
+    process.writeCsvData(summaryData, summaryPath)
+
     spark.stop()
 
 if __name__ == "__main__":
